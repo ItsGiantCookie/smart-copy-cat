@@ -46,49 +46,44 @@ runs:
     - name: Get workflow paths
       shell: bash
       run: |
-        # Extract workflow filename without branch reference
+        # Extract workflow paths using GitHub API with proper error handling
         WORKFLOW_FILE=$(basename "${{ github.workflow_ref }}" '@*')
+        API_URL="https://api.github.com/repos/${{ github.repository }}/contents/.github/workflows/$WORKFLOW_FILE"
         
-        # Get workflow file content
-        RESPONSE=$(curl -s -H "Authorization: Bearer ${{ github.token }}" \
-          "https://api.github.com/repos/${{ github.repository }}/contents/.github/workflows/$WORKFLOW_FILE")
+        curl -s -H "Authorization: Bearer ${{ github.token }}" "$API_URL" > workflow_response.json
         
-        if echo "$RESPONSE" | jq -e '.content' >/dev/null 2>&1; then
-          WORKFLOW_CONTENT=$(echo "$RESPONSE" | jq -r '.content' | base64 -d)
-          
-          # Extract paths with proper escaping
-          echo "$WORKFLOW_CONTENT" | awk '/paths:/{flag=1;next} /\]/{flag=0} flag' | 
-            grep -Eo '-\s+['\''"]?.*['\''"]?' | 
-            sed -E "s/^-\s+['\"]?(.*)['\"]?/\1/" > trigger_paths.txt
-          
-          # Convert glob patterns to regex
-          sed -i 's/\*\*/.*/g; s/\//\\\//g; s/\./\\\./g' trigger_paths.txt
-          PATHS_FILTER=$(paste -sd '|' trigger_paths.txt)
-          echo "PATHS_FILTER=$PATHS_FILTER" >> $GITHUB_ENV
-        else
-          echo "::warning::Could not retrieve workflow file content"
-          echo "PATHS_FILTER=.*" >> $GITHUB_ENV
+        if ! jq -e '.content' workflow_response.json >/dev/null; then
+          echo "::error::Failed to retrieve workflow file"
+          exit 1
         fi
+        
+        jq -r '.content' workflow_response.json | base64 -d | \
+        awk '
+          /paths:/ { capture=1; next }
+          capture && /^[[:space:]]*-/ { 
+            gsub(/^[[:space:]]*-[[:space:]]*[\x27"]?|[\x27"]?$/, "", $0)
+            print $0
+          }
+          capture && /]/ { exit }
+        ' > trigger_paths.txt
+        
+        # Convert glob patterns to find-compatible format
+        sed -i 's/\*\*/*/g; s/^/"/; s/$/"/' trigger_paths.txt
 
     - name: Get matching files
       shell: bash
       run: |
-        # Get changed/all files based on event type
-        if [[ "${{ github.event_name }}" == "push" ]]; then
-          git diff --name-only --diff-filter=AM ${{ github.event.before }} ${{ github.sha }}
-        else
-          git ls-files
-        fi > changed_files.txt
+        # Use find to match exact patterns from workflow file
+        find "${{ env.TMP_SRCDIR }}" -type f \( $(sed 's/^/-path /; s/$/ -o/' trigger_paths.txt | tr '\n' ' ') -false \) > matched_files.txt
         
-        # Filter files using regex
-        grep -E "${{ env.PATHS_FILTER }}" changed_files.txt > filtered_files.txt || true
+        # Make paths relative to source directory
+        sed "s|^${{ env.TMP_SRCDIR }}/||" matched_files.txt > changed_files.txt
         
-        # Verify we have files to process
-        if [ ! -s filtered_files.txt ]; then
+        # Verify files exist
+        if [ ! -s changed_files.txt ]; then
           echo "::warning::No matching files found to copy"
           exit 0
         fi
-        mv filtered_files.txt changed_files.txt
 
     - name: Checkout target repository
       uses: actions/checkout@v4
@@ -114,25 +109,18 @@ runs:
       shell: bash
       run: |
         while IFS= read -r src_file; do
-          if [ -f "${{ env.TMP_SRCDIR }}/$src_file" ]; then
-            dest_file=$(echo "$src_file" | sed "s|^${{ inputs.path-pattern-to-prune }}|${{ inputs.path-pattern-to-insert }}|")
-            mkdir -p "${{ env.TMP_DSTDIR }}/$(dirname "$dest_file")"
-            cp -v "${{ env.TMP_SRCDIR }}/$src_file" "${{ env.TMP_DSTDIR }}/$dest_file"
-          fi
+          dest_file=$(echo "$src_file" | sed "s|^${{ inputs.path-pattern-to-prune }}|${{ inputs.path-pattern-to-insert }}|")
+          mkdir -p "${{ env.TMP_DSTDIR }}/$(dirname "$dest_file")"
+          cp -v "${{ env.TMP_SRCDIR }}/$src_file" "${{ env.TMP_DSTDIR }}/$dest_file"
         done < changed_files.txt
 
     - name: Commit changes
       working-directory: ${{ env.TMP_DSTDIR }}
       shell: bash
       run: |
-        if [ -n "$(git status --porcelain)" ]; then
-          git add -A
-          git commit -m "${{ inputs.commit-message-prefix }}Copied files from ${{ github.repository }}"
-          git push origin ${{ env.PR_BRANCH }}
-        else
-          echo "::notice::No changes to commit"
-          exit 0
-        fi
+        git add -A
+        git commit -m "${{ inputs.commit-message-prefix }}Copied files from ${{ github.repository }}"
+        git push origin ${{ env.PR_BRANCH }}
 
     - name: Create pull request
       shell: bash

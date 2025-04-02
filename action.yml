@@ -5,18 +5,22 @@ branding:
   icon: copy
   color: purple
   
+name: Universal Path Copier
+description: 'Copies only trigger-specified paths between any repositories'
+author: 'ItsGiantCookie'
+
 inputs:
   output-repo:
     required: true
-    description: 'Owner/TargetRepository'
+    description: 'Target repository in format owner/repo'
   output-branch:
     required: true
     description: 'Target branch name'
   path-pattern-to-prune:
-    description: 'Path segment to remove (e.g. "start/")'
+    description: 'Path segment to remove (e.g. "src/")'
     default: ''
   path-pattern-to-insert:
-    description: 'Replacement path segment (e.g. "target/")'
+    description: 'Replacement path segment (e.g. "dist/")'
     default: ''
   commit-message-prefix:
     default: '[Auto-Sync] '
@@ -34,26 +38,56 @@ inputs:
 runs:
   using: 'composite'
   steps:
-    - name: Initialize
+    - name: Initialize environment
       shell: bash
       run: |
         echo "PR_BRANCH=copy-$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_ENV
         echo "TMP_SRCDIR=./source" >> $GITHUB_ENV
         echo "TMP_DSTDIR=./dest" >> $GITHUB_ENV
 
-    - name: Checkout source
+    - name: Checkout source repository
       uses: actions/checkout@v4
       with:
         path: ${{ env.TMP_SRCDIR }}
         fetch-depth: 0
 
-    - name: Get trigger paths
+    - name: Extract trigger paths
       shell: bash
       run: |
-        jq '.push.paths' $GITHUB_EVENT_PATH > trigger_paths.json
-        grep -oP '(?<=").*?(?=")' trigger_paths.json | grep -v '\\[*\\]' > changed_files.txt
+        # Get workflow file path
+        WORKFLOW_FILE=$(curl -s -H "Authorization: Bearer ${{ github.token }}" \
+          "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" | \
+          jq -r '.workflow_url' | awk -F'/contents/' '{print $2}')
+        
+        # Extract trigger paths from workflow file
+        curl -s -H "Authorization: Bearer ${{ github.token }}" \
+          "https://api.github.com/repos/${{ github.repository }}/contents/$WORKFLOW_FILE" | \
+          jq -r '.content' | base64 -d | \
+          grep -A10 'paths:' | grep -E '^\s+-' | sed "s/^[[:space:]]*-\s*'\(.*\)'/\1/" > trigger_paths.txt || \
+          echo "::warning::Could not extract trigger paths from workflow"
 
-    - name: Checkout target
+        # If empty, fall back to git diff
+        if [ ! -s trigger_paths.txt ]; then
+          echo "::notice::Falling back to git diff for changed files"
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            git diff --name-only --diff-filter=AM ${{ github.event.before }} ${{ github.sha }} > changed_files.txt
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            git diff --name-only --diff-filter=AM ${{ github.event.pull_request.base.sha }} HEAD > changed_files.txt
+          fi
+        else
+          # Match changed files against trigger paths
+          while IFS= read -r pattern; do
+            find "${{ env.TMP_SRCDIR }}" -path "$pattern" -type f >> changed_files.txt
+          done < trigger_paths.txt
+        fi
+
+        # Verify we have files to process
+        if [ ! -s changed_files.txt ]; then
+          echo "::warning::No matching files found to copy"
+          exit 0
+        fi
+
+    - name: Checkout target repository
       uses: actions/checkout@v4
       with:
         repository: ${{ inputs.output-repo }}
@@ -73,29 +107,39 @@ runs:
       run: |
         git checkout -b ${{ env.PR_BRANCH }}
 
-    - name: Copy only trigger-specified files
+    - name: Copy and transform files
       shell: bash
       run: |
-        while IFS= read -r trigger_path; do
-          for src_file in ${{ env.TMP_SRCDIR }}/$trigger_path; do
-            if [ -f "$src_file" ]; then
-              relative_path=${src_file#${{ env.TMP_SRCDIR }}/}
-              dest_file=$(echo "$relative_path" | sed "s|^${{ inputs.path-pattern-to-prune }}|${{ inputs.path-pattern-to-insert }}|")
-              mkdir -p "${{ env.TMP_DSTDIR }}/$(dirname "$dest_file")"
-              cp -v "$src_file" "${{ env.TMP_DSTDIR }}/$dest_file"
-            fi
-          done
+        while IFS= read -r src_file; do
+          # Make path relative to source directory
+          relative_path=${src_file#${{ env.TMP_SRCDIR }}/}
+          
+          # Apply path transformation if patterns are specified
+          if [[ -n "${{ inputs.path-pattern-to-prune }}" && -n "${{ inputs.path-pattern-to-insert }}" ]]; then
+            dest_file=$(echo "$relative_path" | sed "s|^${{ inputs.path-pattern-to-prune }}|${{ inputs.path-pattern-to-insert }}|")
+          else
+            dest_file="$relative_path"
+          fi
+          
+          # Create destination directory and copy file
+          mkdir -p "${{ env.TMP_DSTDIR }}/$(dirname "$dest_file")"
+          cp -v "$src_file" "${{ env.TMP_DSTDIR }}/$dest_file"
         done < changed_files.txt
 
     - name: Commit changes
       working-directory: ${{ env.TMP_DSTDIR }}
       shell: bash
       run: |
-        git add -A
-        git commit -m "${{ inputs.commit-message-prefix }}Copied specified paths"
-        git push origin ${{ env.PR_BRANCH }}
+        if [ -n "$(git status --porcelain)" ]; then
+          git add -A
+          git commit -m "${{ inputs.commit-message-prefix }}Copied files from ${{ github.repository }}"
+          git push origin ${{ env.PR_BRANCH }}
+        else
+          echo "::notice::No changes to commit"
+          exit 0
+        fi
 
-    - name: Create PR
+    - name: Create pull request
       shell: bash
       run: |
         curl -X POST \
@@ -103,9 +147,8 @@ runs:
           -H "Accept: application/vnd.github.v3+json" \
           "https://api.github.com/repos/${{ inputs.output-repo }}/pulls" \
           -d '{
-            "title": "'"${{ inputs.pr-title }}"'",
+            "title": "${{ inputs.pr-title }}",
             "head": "'${{ env.PR_BRANCH }}'",
             "base": "'${{ inputs.output-branch }}'",
-            "body": "'"${{ inputs.pr-message }}"'"
+            "body": "${{ inputs.pr-message }}\n\nSource: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
           }'
-        EOF

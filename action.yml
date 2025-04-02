@@ -1,6 +1,6 @@
-name: 'Copy Changed Files with Path Transformation'
+name: 'smart-copy-cat'
 description: 'Copies modified files to another repo with customizable path transformation'
-author: 'Sator Imaging'
+author: 'ItsGiantCookie'
 branding:
   icon: copy
   color: purple
@@ -70,7 +70,7 @@ runs:
         echo "NUM_CHANGED=$(wc -l < ../changed_files.txt)" >> $GITHUB_ENV
 
     - name: Checkout target repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         repository: ${{ inputs.output-repo }}
         token: ${{ inputs.git-token }}

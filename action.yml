@@ -18,6 +18,15 @@ inputs:
   path-pattern-to-insert:
     description: 'Replacement path segment (e.g. "target/")'
     default: ''
+  commit-message-prefix:
+    default: '[Auto-Sync] '
+    description: 'Prefix for commit messages'
+  pr-title:
+    default: 'Automated file sync'
+    description: 'Title for the pull request'
+  pr-message:
+    default: 'Files copied via GitHub Actions'
+    description: 'Description for the pull request'
   git-token:
     required: true
     description: 'PAT with repo write access'
@@ -41,10 +50,8 @@ runs:
     - name: Get trigger paths
       shell: bash
       run: |
-        # Extract exactly the paths specified in the workflow trigger
         jq '.push.paths' $GITHUB_EVENT_PATH > trigger_paths.json
         grep -oP '(?<=").*?(?=")' trigger_paths.json | grep -v '\\[*\\]' > changed_files.txt
-        echo "TRIGGER_PATHS=$(cat changed_files.txt | tr '\n' ' ')" >> $GITHUB_ENV
 
     - name: Checkout target
       uses: actions/checkout@v4
@@ -70,17 +77,11 @@ runs:
       shell: bash
       run: |
         while IFS= read -r trigger_path; do
-          # Handle glob patterns in trigger paths
           for src_file in ${{ env.TMP_SRCDIR }}/$trigger_path; do
             if [ -f "$src_file" ]; then
-              # Remove base path and apply transformation
               relative_path=${src_file#${{ env.TMP_SRCDIR }}/}
               dest_file=$(echo "$relative_path" | sed "s|^${{ inputs.path-pattern-to-prune }}|${{ inputs.path-pattern-to-insert }}|")
-              
-              # Create destination directory
               mkdir -p "${{ env.TMP_DSTDIR }}/$(dirname "$dest_file")"
-              
-              # Copy file
               cp -v "$src_file" "${{ env.TMP_DSTDIR }}/$dest_file"
             fi
           done
@@ -91,7 +92,7 @@ runs:
       shell: bash
       run: |
         git add -A
-        git commit -m "Copied only specified trigger paths"
+        git commit -m "${{ inputs.commit-message-prefix }}Copied specified paths"
         git push origin ${{ env.PR_BRANCH }}
 
     - name: Create PR
@@ -102,9 +103,9 @@ runs:
           -H "Accept: application/vnd.github.v3+json" \
           "https://api.github.com/repos/${{ inputs.output-repo }}/pulls" \
           -d '{
-            "title": "Update: Copied specified paths only",
+            "title": "'"${{ inputs.pr-title }}"'",
             "head": "'${{ env.PR_BRANCH }}'",
             "base": "'${{ inputs.output-branch }}'",
-            "body": "Automated copy of exactly the paths specified in workflow trigger"
+            "body": "'"${{ inputs.pr-message }}"'"
           }'
         EOF

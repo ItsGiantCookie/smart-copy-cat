@@ -47,39 +47,30 @@ runs:
         path: ${{ env.TMP_SRCDIR }}
         fetch-depth: 0
 
-    - name: Extract trigger paths
+    - name: Get changed files
       shell: bash
       run: |
-        # Get workflow file path
-        WORKFLOW_FILE=$(curl -s -H "Authorization: Bearer ${{ github.token }}" \
-          "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" | \
-          jq -r '.workflow_url' | awk -F'/contents/' '{print $2}')
-        
-        # Extract trigger paths from workflow file
-        curl -s -H "Authorization: Bearer ${{ github.token }}" \
-          "https://api.github.com/repos/${{ github.repository }}/contents/$WORKFLOW_FILE" | \
-          jq -r '.content' | base64 -d | \
-          grep -A10 'paths:' | grep -E '^\s+-' | sed "s/^[[:space:]]*-\s*'\(.*\)'/\1/" > trigger_paths.txt || \
-          echo "::warning::Could not extract trigger paths from workflow"
-
-        # If empty, fall back to git diff
-        if [ ! -s trigger_paths.txt ]; then
-          echo "::notice::Falling back to git diff for changed files"
-          if [[ "${{ github.event_name }}" == "push" ]]; then
+        # Fallback method when trigger paths can't be extracted
+        if [[ "${{ github.event_name }}" == "push" ]]; then
+          if [[ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]]; then
+            # Initial commit - get all files
+            git ls-files > changed_files.txt
+          else
+            # Regular push - get changed files
             git diff --name-only --diff-filter=AM ${{ github.event.before }} ${{ github.sha }} > changed_files.txt
-          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            git diff --name-only --diff-filter=AM ${{ github.event.pull_request.base.sha }} HEAD > changed_files.txt
           fi
+        elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          # PR event - get changed files
+          git fetch origin ${{ github.event.pull_request.base.ref }}
+          git diff --name-only --diff-filter=AM origin/${{ github.event.pull_request.base.ref }} HEAD > changed_files.txt
         else
-          # Match changed files against trigger paths
-          while IFS= read -r pattern; do
-            find "${{ env.TMP_SRCDIR }}" -path "$pattern" -type f >> changed_files.txt
-          done < trigger_paths.txt
+          # Manual trigger - get all files
+          git ls-files > changed_files.txt
         fi
 
         # Verify we have files to process
         if [ ! -s changed_files.txt ]; then
-          echo "::warning::No matching files found to copy"
+          echo "::warning::No files found to copy"
           exit 0
         fi
 
@@ -107,19 +98,18 @@ runs:
       shell: bash
       run: |
         while IFS= read -r src_file; do
-          # Make path relative to source directory
-          relative_path=${src_file#${{ env.TMP_SRCDIR }}/}
-          
-          # Apply path transformation if patterns are specified
-          if [[ -n "${{ inputs.path-pattern-to-prune }}" && -n "${{ inputs.path-pattern-to-insert }}" ]]; then
-            dest_file=$(echo "$relative_path" | sed "s|^${{ inputs.path-pattern-to-prune }}|${{ inputs.path-pattern-to-insert }}|")
-          else
-            dest_file="$relative_path"
+          if [ -f "${{ env.TMP_SRCDIR }}/$src_file" ]; then
+            # Apply path transformation if patterns are specified
+            if [[ -n "${{ inputs.path-pattern-to-prune }}" && -n "${{ inputs.path-pattern-to-insert }}" ]]; then
+              dest_file=$(echo "$src_file" | sed "s|^${{ inputs.path-pattern-to-prune }}|${{ inputs.path-pattern-to-insert }}|")
+            else
+              dest_file="$src_file"
+            fi
+            
+            # Create destination directory and copy file
+            mkdir -p "${{ env.TMP_DSTDIR }}/$(dirname "$dest_file")"
+            cp -v "${{ env.TMP_SRCDIR }}/$src_file" "${{ env.TMP_DSTDIR }}/$dest_file"
           fi
-          
-          # Create destination directory and copy file
-          mkdir -p "${{ env.TMP_DSTDIR }}/$(dirname "$dest_file")"
-          cp -v "$src_file" "${{ env.TMP_DSTDIR }}/$dest_file"
         done < changed_files.txt
 
     - name: Commit changes

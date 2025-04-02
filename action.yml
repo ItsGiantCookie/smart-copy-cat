@@ -13,23 +13,19 @@ inputs:
     required: true
     description: 'Target branch name'
   path-pattern-to-prune:
-    description: 'Path segment to remove (e.g. "src/")'
+    description: 'Path segment to remove'
     default: ''
   path-pattern-to-insert:
-    description: 'Replacement path segment (e.g. "dist/")'
+    description: 'Path segment to insert'
     default: ''
   commit-message-prefix:
     default: '[Auto-Sync] '
-    description: 'Prefix for commit messages'
   pr-title:
     default: 'Automated file sync'
-    description: 'Title for the pull request'
   pr-message:
     default: 'Files copied via GitHub Actions'
-    description: 'Description for the pull request'
   git-token:
     required: true
-    description: 'PAT with repo write access'
 
 runs:
   using: 'composite'
@@ -47,30 +43,37 @@ runs:
         path: ${{ env.TMP_SRCDIR }}
         fetch-depth: 0
 
-    - name: Get changed files
+    - name: Get workflow paths
       shell: bash
       run: |
-        # Get files based on event type
+        # Get workflow file path from API
+        WORKFLOW_JSON=$(curl -s -H "Authorization: Bearer ${{ github.token }}" \
+          "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}")
+        
+        WORKFLOW_PATH=$(echo "$WORKFLOW_JSON" | jq -r '.path' | sed 's/\.github%2Fworkflows%2F/.github\/workflows\//')
+        
+        # Extract trigger paths from workflow file
+        TRIGGER_PATHS=$(curl -s -H "Authorization: Bearer ${{ github.token }}" \
+          "https://api.github.com/repos/${{ github.repository }}/contents/$WORKFLOW_PATH" | \
+          jq -r '.content' | base64 -d | \
+          grep -A10 'paths:' | grep -E '^\s+-' | sed -E "s/^[[:space:]]+-[[:space:]]+'?(.*?)'?$/\1/")
+        
+        echo "$TRIGGER_PATHS" > trigger_paths.txt
+        echo "PATHS_FILTER=$(echo "$TRIGGER_PATHS" | tr '\n' '|' | sed 's/|$//')" >> $GITHUB_ENV
+
+    - name: Get matching files
+      shell: bash
+      run: |
+        # Handle different event types
         if [[ "${{ github.event_name }}" == "push" ]]; then
-          if [[ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]]; then
-            git ls-files > all_files.txt
-          else
-            git diff --name-only --diff-filter=AM ${{ github.event.before }} ${{ github.sha }} > changed_files.txt
-          fi
-        elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
-          git diff --name-only --diff-filter=AM ${{ github.event.pull_request.base.sha }} HEAD > changed_files.txt
-        else
-          git ls-files > all_files.txt
+          git diff --name-only --diff-filter=AM ${{ github.event.before }} ${{ github.sha }} > changed_files.txt
+        elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          git ls-files > changed_files.txt
         fi
 
-        # Handle initial commit case
-        if [ -f all_files.txt ]; then
-          mv all_files.txt changed_files.txt
-        fi
-
-        # Filter against workflow trigger paths
-        if [ -n "${{ github.event.paths }}" ]; then
-          grep -E "$(echo "${{ github.event.paths }}" | tr '\n' '|')" changed_files.txt > filtered_files.txt
+        # Filter using paths from workflow
+        if [ -s trigger_paths.txt ]; then
+          grep -E "${{ env.PATHS_FILTER }}" changed_files.txt > filtered_files.txt
           mv filtered_files.txt changed_files.txt
         fi
 
@@ -105,14 +108,7 @@ runs:
       run: |
         while IFS= read -r src_file; do
           if [ -f "${{ env.TMP_SRCDIR }}/$src_file" ]; then
-            # Apply path transformation
-            if [[ -n "${{ inputs.path-pattern-to-prune }}" && -n "${{ inputs.path-pattern-to-insert }}" ]]; then
-              dest_file=$(echo "$src_file" | sed "s|^${{ inputs.path-pattern-to-prune }}|${{ inputs.path-pattern-to-insert }}|")
-            else
-              dest_file="$src_file"
-            fi
-            
-            # Create destination structure
+            dest_file=$(echo "$src_file" | sed "s|^${{ inputs.path-pattern-to-prune }}|${{ inputs.path-pattern-to-insert }}|")
             mkdir -p "${{ env.TMP_DSTDIR }}/$(dirname "$dest_file")"
             cp -v "${{ env.TMP_SRCDIR }}/$src_file" "${{ env.TMP_DSTDIR }}/$dest_file"
           fi
@@ -124,7 +120,7 @@ runs:
       run: |
         if [ -n "$(git status --porcelain)" ]; then
           git add -A
-          git commit -m "${{ inputs.commit-message-prefix }}Copied ${{ github.event.repository.name }} files"
+          git commit -m "${{ inputs.commit-message-prefix }}Copied files from ${{ github.repository }}"
           git push origin ${{ env.PR_BRANCH }}
         else
           echo "::notice::No changes to commit"
@@ -143,4 +139,4 @@ runs:
             "head": "'${{ env.PR_BRANCH }}'",
             "base": "'${{ inputs.output-branch }}'",
             "body": "${{ inputs.pr-message }}\n\nSource: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
-          }' || echo "::warning::PR creation failed"
+          }'

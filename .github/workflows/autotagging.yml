@@ -1,0 +1,23 @@
+name: AutoTagging   # auto-tagging to latest commit (not release commit)
+
+on:
+  release:
+  workflow_dispatch:
+
+env:
+  TAG: 'v1'
+  MESSAGE: 'Tagged by GitHub Actions'
+
+jobs:
+  main:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Tagging
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global user.name '${{ github.actor }}'
+          git config --global user.email 'devnull@inter.net'
+          git tag -f -a '${{ env.TAG }}' -m '${{ env.MESSAGE }}'
+          git push -f --tags

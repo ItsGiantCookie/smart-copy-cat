@@ -46,42 +46,40 @@ runs:
     - name: Get workflow paths
       shell: bash
       run: |
-        # Get workflow file path from API
-        WORKFLOW_JSON=$(curl -s -H "Authorization: Bearer ${{ github.token }}" \
-          "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}")
+        # Get workflow file content
+        WORKFLOW_CONTENT=$(curl -s -H "Authorization: Bearer ${{ github.token }}" \
+          "https://api.github.com/repos/${{ github.repository }}/contents/.github/workflows/$(basename ${{ github.workflow_ref }})" | \
+          jq -r '.content' | base64 -d)
         
-        WORKFLOW_PATH=$(echo "$WORKFLOW_JSON" | jq -r '.path' | sed 's/\.github%2Fworkflows%2F/.github\/workflows\//')
+        # Extract paths with proper escaping
+        echo "$WORKFLOW_CONTENT" | awk '/paths:/{flag=1;next} /\]/{flag=0} flag' | 
+          grep -Eo '[- ]+['\''"]?.*['\''"]?' | 
+          sed -E "s/^[ -]+['\"]?(.*)['\"]?/\1/" > trigger_paths.txt
         
-        # Extract trigger paths from workflow file
-        TRIGGER_PATHS=$(curl -s -H "Authorization: Bearer ${{ github.token }}" \
-          "https://api.github.com/repos/${{ github.repository }}/contents/$WORKFLOW_PATH" | \
-          jq -r '.content' | base64 -d | \
-          grep -A10 'paths:' | grep -E '^\s+-' | sed -E "s/^[[:space:]]+-[[:space:]]+'?(.*?)'?$/\1/")
-        
-        echo "$TRIGGER_PATHS" > trigger_paths.txt
-        echo "PATHS_FILTER=$(echo "$TRIGGER_PATHS" | tr '\n' '|' | sed 's/|$//')" >> $GITHUB_ENV
+        # Convert glob patterns to regex
+        sed -i 's/\*\*/.*/g; s/\//\\\//g; s/\./\\\./g' trigger_paths.txt
+        PATHS_FILTER=$(paste -sd '|' trigger_paths.txt)
+        echo "PATHS_FILTER=$PATHS_FILTER" >> $GITHUB_ENV
 
     - name: Get matching files
       shell: bash
       run: |
-        # Handle different event types
+        # Get changed/all files based on event type
         if [[ "${{ github.event_name }}" == "push" ]]; then
-          git diff --name-only --diff-filter=AM ${{ github.event.before }} ${{ github.sha }} > changed_files.txt
-        elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-          git ls-files > changed_files.txt
-        fi
-
-        # Filter using paths from workflow
-        if [ -s trigger_paths.txt ]; then
-          grep -E "${{ env.PATHS_FILTER }}" changed_files.txt > filtered_files.txt
-          mv filtered_files.txt changed_files.txt
-        fi
-
-        # Verify files exist
-        if [ ! -s changed_files.txt ]; then
+          git diff --name-only --diff-filter=AM ${{ github.event.before }} ${{ github.sha }}
+        else
+          git ls-files
+        fi > changed_files.txt
+        
+        # Filter files using regex
+        grep -E "${{ env.PATHS_FILTER }}" changed_files.txt > filtered_files.txt || true
+        
+        # Verify we have files to process
+        if [ ! -s filtered_files.txt ]; then
           echo "::warning::No matching files found to copy"
           exit 0
         fi
+        mv filtered_files.txt changed_files.txt
 
     - name: Checkout target repository
       uses: actions/checkout@v4

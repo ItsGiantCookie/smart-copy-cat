@@ -46,20 +46,29 @@ runs:
     - name: Get workflow paths
       shell: bash
       run: |
+        # Extract workflow filename without branch reference
+        WORKFLOW_FILE=$(basename "${{ github.workflow_ref }}" '@*')
+        
         # Get workflow file content
-        WORKFLOW_CONTENT=$(curl -s -H "Authorization: Bearer ${{ github.token }}" \
-          "https://api.github.com/repos/${{ github.repository }}/contents/.github/workflows/$(basename ${{ github.workflow_ref }})" | \
-          jq -r '.content' | base64 -d)
+        RESPONSE=$(curl -s -H "Authorization: Bearer ${{ github.token }}" \
+          "https://api.github.com/repos/${{ github.repository }}/contents/.github/workflows/$WORKFLOW_FILE")
         
-        # Extract paths with proper escaping
-        echo "$WORKFLOW_CONTENT" | awk '/paths:/{flag=1;next} /\]/{flag=0} flag' | 
-          grep -Eo '[- ]+['\''"]?.*['\''"]?' | 
-          sed -E "s/^[ -]+['\"]?(.*)['\"]?/\1/" > trigger_paths.txt
-        
-        # Convert glob patterns to regex
-        sed -i 's/\*\*/.*/g; s/\//\\\//g; s/\./\\\./g' trigger_paths.txt
-        PATHS_FILTER=$(paste -sd '|' trigger_paths.txt)
-        echo "PATHS_FILTER=$PATHS_FILTER" >> $GITHUB_ENV
+        if echo "$RESPONSE" | jq -e '.content' >/dev/null 2>&1; then
+          WORKFLOW_CONTENT=$(echo "$RESPONSE" | jq -r '.content' | base64 -d)
+          
+          # Extract paths with proper escaping
+          echo "$WORKFLOW_CONTENT" | awk '/paths:/{flag=1;next} /\]/{flag=0} flag' | 
+            grep -Eo '-\s+['\''"]?.*['\''"]?' | 
+            sed -E "s/^-\s+['\"]?(.*)['\"]?/\1/" > trigger_paths.txt
+          
+          # Convert glob patterns to regex
+          sed -i 's/\*\*/.*/g; s/\//\\\//g; s/\./\\\./g' trigger_paths.txt
+          PATHS_FILTER=$(paste -sd '|' trigger_paths.txt)
+          echo "PATHS_FILTER=$PATHS_FILTER" >> $GITHUB_ENV
+        else
+          echo "::warning::Could not retrieve workflow file content"
+          echo "PATHS_FILTER=.*" >> $GITHUB_ENV
+        fi
 
     - name: Get matching files
       shell: bash

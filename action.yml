@@ -43,39 +43,39 @@ runs:
         path: ${{ env.TMP_SRCDIR }}
         fetch-depth: 0
 
-    - name: Get workflow paths
+    - name: Extract workflow paths
       shell: bash
       run: |
-        # Extract workflow filename from workflow_ref
-        WORKFLOW_FILE=$(basename "${{ github.workflow_ref }}" '@*')
+        WORKFLOW_FILE="${{ env.TMP_SRCDIR }}/.github/workflows/${{ github.workflow }}"
         
-        # Get workflow content from local file since API access might fail
-        WORKFLOW_PATH=".github/workflows/$WORKFLOW_FILE"
+        # Extract paths from workflow file
+        awk '/paths:/{flag=1;next} /\]/{flag=0} flag' "$WORKFLOW_FILE" | 
+          grep -Eo '-\s+['\''"]?.*['\''"]?' | 
+          sed -E "s/^-\s+['\"]?(.*)['\"]?/\1/" > trigger_paths.txt
         
-        if [ -f "$WORKFLOW_PATH" ]; then
-          # Extract paths using yq (YAML processor)
-          PATHS=$(yq e '.on.push.paths[]' "$WORKFLOW_PATH")
-          echo "$PATHS" | while read -r path; do
-            echo "$path" | sed 's/\*\*/*/g; s/^/"/; s/$/"/'
-          done > trigger_paths.txt
-        else
-          echo "::warning::Using default paths from action inputs"
-          echo "${{ github.event.inputs.paths || 'co79_GerRng_Zug_3_0.VR/**' }}" > trigger_paths.txt
-        fi
+        # Convert glob patterns to regex
+        sed -i 's/\*\*/.*/g; s/\./\\\./g; s/\//\\\//g' trigger_paths.txt
+        PATHS_FILTER=$(paste -sd '|' trigger_paths.txt)
+        echo "PATHS_FILTER=$PATHS_FILTER" >> $GITHUB_ENV
 
     - name: Get matching files
       shell: bash
       run: |
-        # Use find with exact path patterns
-        find "${{ env.TMP_SRCDIR }}" -type f \( $(sed 's/^/-path /; s/$/ -o/' trigger_paths.txt) -false \) > matched_files.txt
+        # Get files based on event type
+        if [[ "${{ github.event_name }}" == "push" ]]; then
+          git diff --name-only --diff-filter=AM ${{ github.event.before }} ${{ github.sha }}
+        else
+          git ls-files
+        fi > changed_files.txt
         
-        # Make paths relative to source directory
-        sed "s|^${{ env.TMP_SRCDIR }}/||" matched_files.txt > changed_files.txt
+        # Apply path filter
+        grep -E "${{ env.PATHS_FILTER }}" changed_files.txt > filtered_files.txt || true
         
-        if [ ! -s changed_files.txt ]; then
+        if [ ! -s filtered_files.txt ]; then
           echo "::warning::No matching files found to copy"
           exit 0
         fi
+        mv filtered_files.txt changed_files.txt
 
     - name: Checkout target repository
       uses: actions/checkout@v4
@@ -110,14 +110,9 @@ runs:
       working-directory: ${{ env.TMP_DSTDIR }}
       shell: bash
       run: |
-        if [ -n "$(git status --porcelain)" ]; then
-          git add -A
-          git commit -m "${{ inputs.commit-message-prefix }}Copied files from ${{ github.repository }}"
-          git push origin ${{ env.PR_BRANCH }}
-        else
-          echo "::notice::No changes to commit"
-          exit 0
-        fi
+        git add -A
+        git commit -m "${{ inputs.commit-message-prefix }}Copied files from ${{ github.repository }}"
+        git push origin ${{ env.PR_BRANCH }}
 
     - name: Create pull request
       shell: bash

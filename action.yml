@@ -46,40 +46,32 @@ runs:
     - name: Get workflow paths
       shell: bash
       run: |
-        # Extract workflow paths using GitHub API with proper error handling
+        # Extract workflow filename from workflow_ref
         WORKFLOW_FILE=$(basename "${{ github.workflow_ref }}" '@*')
-        API_URL="https://api.github.com/repos/${{ github.repository }}/contents/.github/workflows/$WORKFLOW_FILE"
         
-        curl -s -H "Authorization: Bearer ${{ github.token }}" "$API_URL" > workflow_response.json
+        # Get workflow content from local file since API access might fail
+        WORKFLOW_PATH=".github/workflows/$WORKFLOW_FILE"
         
-        if ! jq -e '.content' workflow_response.json >/dev/null; then
-          echo "::error::Failed to retrieve workflow file"
-          exit 1
+        if [ -f "$WORKFLOW_PATH" ]; then
+          # Extract paths using yq (YAML processor)
+          PATHS=$(yq e '.on.push.paths[]' "$WORKFLOW_PATH")
+          echo "$PATHS" | while read -r path; do
+            echo "$path" | sed 's/\*\*/*/g; s/^/"/; s/$/"/'
+          done > trigger_paths.txt
+        else
+          echo "::warning::Using default paths from action inputs"
+          echo "${{ github.event.inputs.paths || 'co79_GerRng_Zug_3_0.VR/**' }}" > trigger_paths.txt
         fi
-        
-        jq -r '.content' workflow_response.json | base64 -d | \
-        awk '
-          /paths:/ { capture=1; next }
-          capture && /^[[:space:]]*-/ { 
-            gsub(/^[[:space:]]*-[[:space:]]*[\x27"]?|[\x27"]?$/, "", $0)
-            print $0
-          }
-          capture && /]/ { exit }
-        ' > trigger_paths.txt
-        
-        # Convert glob patterns to find-compatible format
-        sed -i 's/\*\*/*/g; s/^/"/; s/$/"/' trigger_paths.txt
 
     - name: Get matching files
       shell: bash
       run: |
-        # Use find to match exact patterns from workflow file
-        find "${{ env.TMP_SRCDIR }}" -type f \( $(sed 's/^/-path /; s/$/ -o/' trigger_paths.txt | tr '\n' ' ') -false \) > matched_files.txt
+        # Use find with exact path patterns
+        find "${{ env.TMP_SRCDIR }}" -type f \( $(sed 's/^/-path /; s/$/ -o/' trigger_paths.txt) -false \) > matched_files.txt
         
         # Make paths relative to source directory
         sed "s|^${{ env.TMP_SRCDIR }}/||" matched_files.txt > changed_files.txt
         
-        # Verify files exist
         if [ ! -s changed_files.txt ]; then
           echo "::warning::No matching files found to copy"
           exit 0
@@ -118,9 +110,14 @@ runs:
       working-directory: ${{ env.TMP_DSTDIR }}
       shell: bash
       run: |
-        git add -A
-        git commit -m "${{ inputs.commit-message-prefix }}Copied files from ${{ github.repository }}"
-        git push origin ${{ env.PR_BRANCH }}
+        if [ -n "$(git status --porcelain)" ]; then
+          git add -A
+          git commit -m "${{ inputs.commit-message-prefix }}Copied files from ${{ github.repository }}"
+          git push origin ${{ env.PR_BRANCH }}
+        else
+          echo "::notice::No changes to commit"
+          exit 0
+        fi
 
     - name: Create pull request
       shell: bash

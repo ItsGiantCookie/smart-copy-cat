@@ -5,6 +5,7 @@ branding:
   icon: copy
   color: purple
 
+
 inputs:
   output-repo:
     required: true
@@ -13,19 +14,23 @@ inputs:
     required: true
     description: 'Target branch name'
   path-pattern-to-prune:
-    description: 'Path segment to remove'
+    description: 'Path segment to remove (e.g. "src/")'
     default: ''
   path-pattern-to-insert:
-    description: 'Path segment to insert'
+    description: 'Replacement path segment (e.g. "dist/")'
     default: ''
   commit-message-prefix:
     default: '[Auto-Sync] '
+    description: 'Prefix for commit messages'
   pr-title:
     default: 'Automated file sync'
+    description: 'Title for the pull request'
   pr-message:
     default: 'Files copied via GitHub Actions'
+    description: 'Description for the pull request'
   git-token:
     required: true
+    description: 'PAT with repo write access'
 
 runs:
   using: 'composite'
@@ -43,51 +48,32 @@ runs:
         path: ${{ env.TMP_SRCDIR }}
         fetch-depth: 0
 
-    - name: Extract workflow paths
+    - name: Get changed files
       shell: bash
       run: |
-        # Get workflow filename from workflow_ref
-        WORKFLOW_PATH="${GITHUB_WORKFLOW_REF#*@}"
-        WORKFLOW_FILE="${WORKFLOW_PATH#.github/workflows/}"
-        WORKFLOW_FILE="${WORKFLOW_FILE%/*}"
-        
-        # Find actual workflow file path
-        FULL_PATH=$(find "${{ env.TMP_SRCDIR }}/.github/workflows" -name "*${WORKFLOW_FILE}*" -print -quit)
-        
-        if [ -z "$FULL_PATH" ]; then
-          echo "::error::Could not find workflow file"
-          exit 1
+        # Fallback method when trigger paths can't be extracted
+        if [[ "${{ github.event_name }}" == "push" ]]; then
+          if [[ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]]; then
+            # Initial commit - get all files
+            git ls-files > changed_files.txt
+          else
+            # Regular push - get changed files
+            git diff --name-only --diff-filter=AM ${{ github.event.before }} ${{ github.sha }} > changed_files.txt
+          fi
+        elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          # PR event - get changed files
+          git fetch origin ${{ github.event.pull_request.base.ref }}
+          git diff --name-only --diff-filter=AM origin/${{ github.event.pull_request.base.ref }} HEAD > changed_files.txt
+        else
+          # Manual trigger - get all files
+          git ls-files > changed_files.txt
         fi
 
-        # Extract paths from workflow file
-        awk '/paths:/{flag=1;next} /\]/{flag=0} flag' "$FULL_PATH" | 
-          grep -Eo '-\s+['\''"]?.*['\''"]?' | 
-          sed -E "s/^[[:space:]]*-[[:space:]]*['\"]?//" |
-          sed -E "s/['\"]?$//" > trigger_paths.txt
-
-        # Convert glob patterns to regex
-        sed -i 's/\*\*/.*/g; s/\./\\\./g; s/\//\\\//g' trigger_paths.txt
-        PATHS_FILTER=$(paste -sd '|' trigger_paths.txt)
-        echo "PATHS_FILTER=$PATHS_FILTER" >> $GITHUB_ENV
-
-    - name: Get matching files
-      shell: bash
-      run: |
-        # Get files based on event type
-        if [[ "${{ github.event_name }}" == "push" ]]; then
-          git diff --name-only --diff-filter=AM ${{ github.event.before }} ${{ github.sha }}
-        else
-          git ls-files
-        fi > changed_files.txt
-        
-        # Apply path filter
-        grep -E "${{ env.PATHS_FILTER }}" changed_files.txt > filtered_files.txt || true
-        
-        if [ ! -s filtered_files.txt ]; then
-          echo "::warning::No matching files found to copy"
+        # Verify we have files to process
+        if [ ! -s changed_files.txt ]; then
+          echo "::warning::No files found to copy"
           exit 0
         fi
-        mv filtered_files.txt changed_files.txt
 
     - name: Checkout target repository
       uses: actions/checkout@v4
@@ -113,18 +99,32 @@ runs:
       shell: bash
       run: |
         while IFS= read -r src_file; do
-          dest_file=$(echo "$src_file" | sed "s|^${{ inputs.path-pattern-to-prune }}|${{ inputs.path-pattern-to-insert }}|")
-          mkdir -p "${{ env.TMP_DSTDIR }}/$(dirname "$dest_file")"
-          cp -v "${{ env.TMP_SRCDIR }}/$src_file" "${{ env.TMP_DSTDIR }}/$dest_file"
+          if [ -f "${{ env.TMP_SRCDIR }}/$src_file" ]; then
+            # Apply path transformation if patterns are specified
+            if [[ -n "${{ inputs.path-pattern-to-prune }}" && -n "${{ inputs.path-pattern-to-insert }}" ]]; then
+              dest_file=$(echo "$src_file" | sed "s|^${{ inputs.path-pattern-to-prune }}|${{ inputs.path-pattern-to-insert }}|")
+            else
+              dest_file="$src_file"
+            fi
+            
+            # Create destination directory and copy file
+            mkdir -p "${{ env.TMP_DSTDIR }}/$(dirname "$dest_file")"
+            cp -v "${{ env.TMP_SRCDIR }}/$src_file" "${{ env.TMP_DSTDIR }}/$dest_file"
+          fi
         done < changed_files.txt
 
     - name: Commit changes
       working-directory: ${{ env.TMP_DSTDIR }}
       shell: bash
       run: |
-        git add -A
-        git commit -m "${{ inputs.commit-message-prefix }}Copied files from ${{ github.repository }}"
-        git push origin ${{ env.PR_BRANCH }}
+        if [ -n "$(git status --porcelain)" ]; then
+          git add -A
+          git commit -m "${{ inputs.commit-message-prefix }}Copied files from ${{ github.repository }}"
+          git push origin ${{ env.PR_BRANCH }}
+        else
+          echo "::notice::No changes to commit"
+          exit 0
+        fi
 
     - name: Create pull request
       shell: bash

@@ -46,13 +46,25 @@ runs:
     - name: Extract workflow paths
       shell: bash
       run: |
-        WORKFLOW_FILE="${{ env.TMP_SRCDIR }}/.github/workflows/${{ github.workflow }}"
+        # Get workflow filename from workflow_ref
+        WORKFLOW_PATH="${GITHUB_WORKFLOW_REF#*@}"
+        WORKFLOW_FILE="${WORKFLOW_PATH#.github/workflows/}"
+        WORKFLOW_FILE="${WORKFLOW_FILE%/*}"
         
+        # Find actual workflow file path
+        FULL_PATH=$(find "${{ env.TMP_SRCDIR }}/.github/workflows" -name "*${WORKFLOW_FILE}*" -print -quit)
+        
+        if [ -z "$FULL_PATH" ]; then
+          echo "::error::Could not find workflow file"
+          exit 1
+        fi
+
         # Extract paths from workflow file
-        awk '/paths:/{flag=1;next} /\]/{flag=0} flag' "$WORKFLOW_FILE" | 
+        awk '/paths:/{flag=1;next} /\]/{flag=0} flag' "$FULL_PATH" | 
           grep -Eo '-\s+['\''"]?.*['\''"]?' | 
-          sed -E "s/^-\s+['\"]?(.*)['\"]?/\1/" > trigger_paths.txt
-        
+          sed -E "s/^[[:space:]]*-[[:space:]]*['\"]?//" |
+          sed -E "s/['\"]?$//" > trigger_paths.txt
+
         # Convert glob patterns to regex
         sed -i 's/\*\*/.*/g; s/\./\\\./g; s/\//\\\//g' trigger_paths.txt
         PATHS_FILTER=$(paste -sd '|' trigger_paths.txt)

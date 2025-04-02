@@ -4,10 +4,6 @@ author: 'ItsGiantCookie'
 branding:
   icon: copy
   color: purple
-  
-name: Universal Path Copier
-description: 'Copies only trigger-specified paths between any repositories'
-author: 'ItsGiantCookie'
 
 inputs:
   output-repo:

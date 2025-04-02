@@ -1,75 +1,49 @@
 name: 'smart-copy-cat'
-description: 'Copies modified files to another repo with customizable path transformation'
+description: 'Copies only trigger-specified paths to another repository'
 author: 'ItsGiantCookie'
-branding:
-  icon: copy
-  color: purple
 
 inputs:
   output-repo:
     required: true
-    description: 'Owner/AnotherRepository'
+    description: 'Owner/TargetRepository'
   output-branch:
     required: true
-    description: 'Branch name on target repository for PR'
+    description: 'Target branch name'
   path-pattern-to-prune:
-    description: 'Part of path to remove (e.g. "scenario.VR/")'
+    description: 'Path segment to remove (e.g. "start/")'
     default: ''
   path-pattern-to-insert:
-    description: 'Replacement path segment (e.g. "alteredScenario.Enoch/")'
+    description: 'Replacement path segment (e.g. "target/")'
     default: ''
-  commit-message-prefix:
-    default: '[actions] '
-  output-directory:
-    default: "${{ github.event.repository.name }}"
-  pr-branch-prefix:
-    default: "actions/${{ github.event.repository.name }}"
-  pr-title:
-    default: "GitHub Actions: Update from ${{ github.event.repository.name }}"
-  pr-message:
-    default: "Automated update from ${{ github.server_url }}/${{ github.repository }}"
-  git-name:
-    default: "github-actions[bot]"
-  git-email:
-    default: 'github-actions[bot]@users.noreply.github.com'
   git-token:
     required: true
-    description: 'PAT for committing to target repo'
+    description: 'PAT with repo write access'
 
 runs:
   using: 'composite'
   steps:
-    - name: Initialize environment
+    - name: Initialize
       shell: bash
       run: |
-        echo "PR_BRANCH=${{ inputs.pr-branch-prefix }}---$(date +'%Y-%m-%d--%H-%M-%S')" >> $GITHUB_ENV
+        echo "PR_BRANCH=copy-$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_ENV
         echo "TMP_SRCDIR=./source" >> $GITHUB_ENV
         echo "TMP_DSTDIR=./dest" >> $GITHUB_ENV
 
-    - name: Checkout source repository
-      uses: actions/checkout@v3
+    - name: Checkout source
+      uses: actions/checkout@v4
       with:
         path: ${{ env.TMP_SRCDIR }}
         fetch-depth: 0
 
-    - name: Identify changed files
+    - name: Get trigger paths
       shell: bash
-      working-directory: ${{ env.TMP_SRCDIR }}
       run: |
-        if [[ "${{ github.event_name }}" == "push" ]]; then
-          if [[ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]]; then
-            git ls-files > ../changed_files.txt
-          else
-            git diff --name-only --diff-filter=AM ${{ github.event.before }} ${{ github.sha }} > ../changed_files.txt
-          fi
-        elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
-          git fetch origin ${{ github.event.pull_request.base.ref }}
-          git diff --name-only --diff-filter=AM origin/${{ github.event.pull_request.base.ref }} HEAD > ../changed_files.txt
-        fi
-        
-        echo "NUM_CHANGED=$(wc -l < ../changed_files.txt)" >> $GITHUB_ENV
+        # Extract exactly the paths specified in the workflow trigger
+        jq '.push.paths' $GITHUB_EVENT_PATH > trigger_paths.json
+        grep -oP '(?<=").*?(?=")' trigger_paths.json | grep -v '\\[*\\]' > changed_files.txt
+        echo "TRIGGER_PATHS=$(cat changed_files.txt | tr '\n' ' ')" >> $GITHUB_ENV
 
-    - name: Checkout target repository
+    - name: Checkout target
       uses: actions/checkout@v4
       with:
         repository: ${{ inputs.output-repo }}
@@ -79,8 +53,8 @@ runs:
     - name: Configure Git
       shell: bash
       run: |
-        git config --global user.name "${{ inputs.git-name }}"
-        git config --global user.email "${{ inputs.git-email }}"
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
         git config --global url."https://${{ inputs.git-token }}@github.com/".insteadOf "https://github.com/"
 
     - name: Prepare target branch
@@ -88,40 +62,34 @@ runs:
       shell: bash
       run: |
         git checkout -b ${{ env.PR_BRANCH }}
-        mkdir -p "${{ inputs.output-directory }}"
 
-    - name: Transform and copy files
-      working-directory: ${{ env.TMP_DSTDIR }}
+    - name: Copy only trigger-specified files
       shell: bash
       run: |
-        while IFS= read -r src_file; do
-          if [ -f "../${{ env.TMP_SRCDIR }}/$src_file" ]; then
-            # Apply path transformation if patterns are specified
-            if [[ -n "${{ inputs.path-pattern-to-prune }}" && -n "${{ inputs.path-pattern-to-insert }}" ]]; then
-              dest_file=$(echo "$src_file" | sed "s|^${{ inputs.path-pattern-to-prune }}|${{ inputs.path-pattern-to-insert }}|")
-            else
-              dest_file="$src_file"
+        while IFS= read -r trigger_path; do
+          # Handle glob patterns in trigger paths
+          for src_file in ${{ env.TMP_SRCDIR }}/$trigger_path; do
+            if [ -f "$src_file" ]; then
+              # Remove base path and apply transformation
+              relative_path=${src_file#${{ env.TMP_SRCDIR }}/}
+              dest_file=$(echo "$relative_path" | sed "s|^${{ inputs.path-pattern-to-prune }}|${{ inputs.path-pattern-to-insert }}|")
+              
+              # Create destination directory
+              mkdir -p "${{ env.TMP_DSTDIR }}/$(dirname "$dest_file")"
+              
+              # Copy file
+              cp -v "$src_file" "${{ env.TMP_DSTDIR }}/$dest_file"
             fi
-            
-            # Ensure output directory is included
-            dest_path="${{ inputs.output-directory }}/$dest_file"
-            
-            mkdir -p "$(dirname "$dest_path")"
-            cp -v "../${{ env.TMP_SRCDIR }}/$src_file" "$dest_path"
-          fi
-        done < ../changed_files.txt
+          done
+        done < changed_files.txt
 
     - name: Commit changes
       working-directory: ${{ env.TMP_DSTDIR }}
       shell: bash
       run: |
         git add -A
-        git commit -m "${{ inputs.commit-message-prefix }}${{ github.event.repository.name }} - ${{ env.NUM_CHANGED }} files"
-
-    - name: Push changes
-      working-directory: ${{ env.TMP_DSTDIR }}
-      shell: bash
-      run: git push origin ${{ env.PR_BRANCH }}
+        git commit -m "Copied only specified trigger paths"
+        git push origin ${{ env.PR_BRANCH }}
 
     - name: Create PR
       shell: bash
@@ -130,11 +98,10 @@ runs:
           -H "Authorization: Bearer ${{ inputs.git-token }}" \
           -H "Accept: application/vnd.github.v3+json" \
           "https://api.github.com/repos/${{ inputs.output-repo }}/pulls" \
-          -d @- <<EOF
-          {
-            "title": "${{ inputs.pr-title }}",
-            "body": "${{ inputs.pr-message }}",
-            "head": "${{ env.PR_BRANCH }}",
-            "base": "${{ inputs.output-branch }}"
-          }
+          -d '{
+            "title": "Update: Copied specified paths only",
+            "head": "'${{ env.PR_BRANCH }}'",
+            "base": "'${{ inputs.output-branch }}'",
+            "body": "Automated copy of exactly the paths specified in workflow trigger"
+          }'
         EOF

@@ -1,7 +1,10 @@
 name: 'smart-copy-cat'
 description: 'Copies only trigger-specified paths to another repository'
 author: 'ItsGiantCookie'
-
+branding:
+  icon: copy
+  color: purple
+  
 inputs:
   output-repo:
     required: true

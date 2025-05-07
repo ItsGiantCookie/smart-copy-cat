@@ -1,3 +1,4 @@
+WIP
 # smart-copy-cat: Copy Changed Files with Path Transformation
 
 This GitHub Action copies modified files from the triggering repository to another repository while allowing path transformation, and automatically creates a pull request with the changes.
